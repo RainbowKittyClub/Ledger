@@ -10,6 +10,7 @@ import com.github.quiltservertools.ledger.config.CONFIG_PATH
 import com.github.quiltservertools.ledger.config.DatabaseSpec
 import com.github.quiltservertools.ledger.database.ActionQueueService
 import com.github.quiltservertools.ledger.database.DatabaseManager
+import com.github.quiltservertools.ledger.database.ProducerBatchService
 import com.github.quiltservertools.ledger.listeners.registerBlockListeners
 import com.github.quiltservertools.ledger.listeners.registerEntityListeners
 import com.github.quiltservertools.ledger.listeners.registerPlayerListeners
@@ -110,6 +111,7 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
             DatabaseManager.autoPurge()
         }.invokeOnCompletion {
             ActionQueueService.start()
+            ProducerBatchService.start()
         }
     }
 
@@ -128,12 +130,18 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
                         }
                     }
                     ActionQueueService.drainAll()
+                    ProducerBatchService.drain()
                     logInfo("Successfully drained database queue")
                 }
             } catch (e: TimeoutCancellationException) {
                 logWarn(
                     "Database drain timed out. ${ActionQueueService.size} actions still in queue. Data may be lost.",
                 )
+                logWarn(
+                    "${ProducerBatchService.pendingBatchCount} producer batches were not committed; " +
+                        "their producers were told and can retry.",
+                )
+                ProducerBatchService.abandon()
             }
         }
     }

@@ -1,9 +1,12 @@
 package com.github.quiltservertools.ledger.database
 
 import net.minecraft.resources.Identifier
+import org.jetbrains.exposed.v1.core.ReferenceOption
+import org.jetbrains.exposed.v1.core.Table
 import org.jetbrains.exposed.v1.core.alias
 import org.jetbrains.exposed.v1.core.dao.id.EntityID
 import org.jetbrains.exposed.v1.core.dao.id.IntIdTable
+import org.jetbrains.exposed.v1.core.dao.id.LongIdTable
 import org.jetbrains.exposed.v1.dao.IntEntity
 import org.jetbrains.exposed.v1.dao.IntEntityClass
 import org.jetbrains.exposed.v1.javatime.timestamp
@@ -13,6 +16,8 @@ private const val MAX_PLAYER_NAME_LENGTH = 16
 private const val MAX_ACTION_NAME_LENGTH = 16
 private const val MAX_IDENTIFIER_LENGTH = 191
 private const val MAX_SOURCE_NAME_LENGTH = 30
+private const val PAYLOAD_HASH_LENGTH = 64
+private const val MAX_SCHEMA_COMPONENT_LENGTH = 64
 
 object Tables {
     object Players : IntIdTable("players") {
@@ -111,5 +116,33 @@ object Tables {
         var identifier by Worlds.identifier.transform({ it.toString() }, { Identifier.tryParse(it)!! })
 
         companion object : IntEntityClass<World>(Worlds)
+    }
+
+    /** One row per committed producer batch; its id is the receipt producers keep. */
+    object ProducerBatches : LongIdTable("producer_batches") {
+        val producer = varchar("producer", MAX_SOURCE_NAME_LENGTH)
+        val operationId = uuid("operation_id")
+        val committedAt = timestamp("committed_at").clientDefault { Instant.now() }
+    }
+
+    /** Producer keys, committed with their action rows; a purge keeps the key and drops the link. */
+    object ProducerReceipts : LongIdTable("producer_receipts") {
+        val producer = varchar("producer", MAX_SOURCE_NAME_LENGTH)
+        val operationId = uuid("operation_id")
+        val sequence = long("sequence")
+        val payloadHash = varchar("payload_hash", PAYLOAD_HASH_LENGTH)
+        val batch = reference("batch_id", ProducerBatches.id)
+        val action = optReference("action_id", Actions.id, onDelete = ReferenceOption.SET_NULL)
+
+        init {
+            uniqueIndex("producer_receipt_key", producer, operationId, sequence)
+        }
+    }
+
+    /** Versions of additive schema parts, so an older build refuses a newer database. */
+    object SchemaVersions : Table("ledger_schema_versions") {
+        val component = varchar("component", MAX_SCHEMA_COMPONENT_LENGTH)
+        val version = integer("version")
+        override val primaryKey = PrimaryKey(component)
     }
 }

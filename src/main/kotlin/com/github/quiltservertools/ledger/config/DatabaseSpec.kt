@@ -16,6 +16,9 @@ object DatabaseSpec : ConfigSpec() {
     val logSQL by optional<Boolean>(false)
     val location by optional<String?>(null)
     val updateSchema by optional<Boolean>(false)
+    val producerMaxBatchActions by optional<Int>(131_072)
+    val producerMaxPendingActions by optional<Int>(262_144)
+    val producerMaxPendingBatches by optional<Int>(256)
 }
 
 fun Config.getDatabasePath(): Path {

@@ -6,7 +6,9 @@ import com.github.quiltservertools.ledger.actionutils.ActionSearchParams
 import com.github.quiltservertools.ledger.actionutils.SearchResults
 import com.github.quiltservertools.ledger.database.ActionQueueService
 import com.github.quiltservertools.ledger.database.DatabaseManager
+import com.github.quiltservertools.ledger.database.ProducerBatchService
 import kotlinx.coroutines.future.future
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 
 internal object LedgerApiImpl : LedgerApi {
@@ -25,4 +27,13 @@ internal object LedgerApiImpl : LedgerApi {
     override fun logAction(action: ActionType) {
         ActionQueueService.addToQueue(action)
     }
+
+    override fun appendBatch(batch: ProducerBatch): CompletableFuture<BatchAck> = ProducerBatchService.submit(batch)
+
+    override fun validateProducerAction(action: ActionType): String? = ProducerBatchService.validate(action)
+
+    override fun producerBatchLimit(): Int = ProducerBatchService.batchLimit()
+
+    override fun producerReceipts(producer: String, operationId: UUID): CompletableFuture<List<ProducerReceipt>> =
+        Ledger.future { DatabaseManager.producerReceipts(producer, operationId) }
 }

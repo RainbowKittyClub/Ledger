@@ -5,6 +5,10 @@ import com.github.quiltservertools.ledger.actions.ActionType
 import com.github.quiltservertools.ledger.actionutils.ActionSearchParams
 import com.github.quiltservertools.ledger.actionutils.Preview
 import com.github.quiltservertools.ledger.actionutils.SearchResults
+import com.github.quiltservertools.ledger.api.BatchAck
+import com.github.quiltservertools.ledger.api.ProducerBatch
+import com.github.quiltservertools.ledger.api.ProducerBatchException
+import com.github.quiltservertools.ledger.api.ProducerReceipt
 import com.github.quiltservertools.ledger.config.DatabaseSpec
 import com.github.quiltservertools.ledger.config.SearchSpec
 import com.github.quiltservertools.ledger.config.config
@@ -41,6 +45,7 @@ import org.jetbrains.exposed.v1.core.isNull
 import org.jetbrains.exposed.v1.core.lessEq
 import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.core.or
+import org.jetbrains.exposed.v1.core.statements.BatchInsertStatement
 import org.jetbrains.exposed.v1.core.statements.StatementContext
 import org.jetbrains.exposed.v1.core.statements.expandArgs
 import org.jetbrains.exposed.v1.dao.Entity
@@ -52,6 +57,7 @@ import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import org.jetbrains.exposed.v1.jdbc.andWhere
 import org.jetbrains.exposed.v1.jdbc.batchInsert
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.insertAndGetId
 import org.jetbrains.exposed.v1.jdbc.insertIgnore
 import org.jetbrains.exposed.v1.jdbc.orWhere
@@ -73,7 +79,9 @@ import kotlin.math.ceil
 const val MAX_QUERY_RETRIES = 10
 const val MIN_RETRY_DELAY = 1000L
 const val MAX_RETRY_DELAY = 300_000L
-private const val MAX_EXTRA_DATA_BYTES = 65_535
+internal const val MAX_EXTRA_DATA_CHARS = 65_535
+private const val PRODUCER_SCHEMA_COMPONENT = "producer_batches"
+private const val PRODUCER_SCHEMA_VERSION = 1
 
 object DatabaseManager {
 
@@ -121,7 +129,11 @@ object DatabaseManager {
             Tables.ObjectIdentifiers,
             Tables.Sources,
             Tables.Worlds,
+            Tables.ProducerBatches,
+            Tables.ProducerReceipts,
+            Tables.SchemaVersions,
         )
+        checkSchemaVersion(PRODUCER_SCHEMA_COMPONENT, PRODUCER_SCHEMA_VERSION)
         if (config[DatabaseSpec.updateSchema]) {
             try {
                 exec("CREATE INDEX IF NOT EXISTS actions_time ON actions(time)")
@@ -402,6 +414,29 @@ object DatabaseManager {
         }
     }
 
+    suspend fun appendProducerBatch(batch: ProducerBatch): BatchAck = execute {
+        storeProducerBatch(batch)
+    }
+
+    suspend fun producerReceipts(producer: String, operationId: UUID): List<ProducerReceipt> = execute {
+        Tables.ProducerReceipts.selectAll()
+            .where {
+                (Tables.ProducerReceipts.producer eq producer) and
+                    (Tables.ProducerReceipts.operationId eq operationId)
+            }
+            .orderBy(Tables.ProducerReceipts.sequence)
+            .map {
+                ProducerReceipt(
+                    it[Tables.ProducerReceipts.producer],
+                    it[Tables.ProducerReceipts.operationId],
+                    it[Tables.ProducerReceipts.sequence],
+                    it[Tables.ProducerReceipts.payloadHash],
+                    it[Tables.ProducerReceipts.batch].value,
+                    it[Tables.ProducerReceipts.action]?.value,
+                )
+            }
+    }
+
     suspend fun registerWorld(identifier: Identifier) = execute {
         insertWorld(identifier)
     }
@@ -463,9 +498,97 @@ object DatabaseManager {
         }
     }
 
+    private fun Transaction.checkSchemaVersion(component: String, supported: Int) {
+        val stored = Tables.SchemaVersions.selectAll()
+            .where { Tables.SchemaVersions.component eq component }
+            .firstOrNull()?.get(Tables.SchemaVersions.version)
+        when {
+            stored == null -> Tables.SchemaVersions.insert {
+                it[Tables.SchemaVersions.component] = component
+                it[Tables.SchemaVersions.version] = supported
+            }
+
+            stored > supported -> error(
+                "Database $component schema $stored is newer than this Ledger supports ($supported)",
+            )
+        }
+    }
+
+    // Keys and action rows commit together; a stored key with another payload rolls the batch back.
+    private fun Transaction.storeProducerBatch(batch: ProducerBatch): BatchAck {
+        val entries = batch.entries()
+        val hashes = entries.associate { it.sequence() to ProducerPayload.hash(it.action()) }
+        val stored = Tables.ProducerReceipts.selectAll()
+            .where {
+                (Tables.ProducerReceipts.producer eq batch.producer()) and
+                    (Tables.ProducerReceipts.operationId eq batch.operationId()) and
+                    Tables.ProducerReceipts.sequence.between(entries.first().sequence(), entries.last().sequence())
+            }
+            .filter { hashes.containsKey(it[Tables.ProducerReceipts.sequence]) }
+            .associate {
+                it[Tables.ProducerReceipts.sequence] to
+                    (it[Tables.ProducerReceipts.payloadHash] to it[Tables.ProducerReceipts.batch].value)
+            }
+        stored.entries.firstOrNull { hashes[it.key] != it.value.first }?.let {
+            throw ProducerBatchException(
+                ProducerBatchException.Reason.CONFLICT,
+                "sequence ${it.key} of ${batch.producer()} ${batch.operationId()} is stored with a different payload",
+            )
+        }
+        val fresh = entries.filter { it.sequence() !in stored }
+        val duplicates = entries.map { it.sequence() }.filter { it in stored }
+        if (fresh.isEmpty()) {
+            return BatchAck(
+                batch.producer(),
+                batch.operationId(),
+                stored.values.minOf { it.second },
+                emptyList(),
+                duplicates,
+            )
+        }
+        val batchId = Tables.ProducerBatches.insertAndGetId {
+            it[Tables.ProducerBatches.producer] = batch.producer()
+            it[Tables.ProducerBatches.operationId] = batch.operationId()
+        }
+        val actionIds = Tables.Actions.batchInsert(fresh.map { it.action() }, shouldReturnGeneratedValues = true) {
+            bindAction(it)
+        }.map { it[Tables.Actions.id] }
+        check(actionIds.size == fresh.size) { "Inserted ${actionIds.size} action rows for ${fresh.size} entries" }
+        Tables.ProducerReceipts.batchInsert(
+            fresh.zip(actionIds),
+            shouldReturnGeneratedValues = false,
+        ) { (entry, actionId) ->
+            this[Tables.ProducerReceipts.producer] = batch.producer()
+            this[Tables.ProducerReceipts.operationId] = batch.operationId()
+            this[Tables.ProducerReceipts.sequence] = entry.sequence()
+            this[Tables.ProducerReceipts.payloadHash] = hashes.getValue(entry.sequence())
+            this[Tables.ProducerReceipts.batch] = batchId
+            this[Tables.ProducerReceipts.action] = actionId
+        }
+        return BatchAck(batch.producer(), batch.operationId(), batchId.value, fresh.map { it.sequence() }, duplicates)
+    }
+
+    private fun BatchInsertStatement.bindAction(action: ActionType) {
+        this[Tables.Actions.actionIdentifier] = getOrCreateActionId(action.identifier)
+        this[Tables.Actions.timestamp] = action.timestamp
+        this[Tables.Actions.x] = action.pos.x
+        this[Tables.Actions.y] = action.pos.y
+        this[Tables.Actions.z] = action.pos.z
+        this[Tables.Actions.objectId] = getOrCreateRegistryKeyId(action.objectIdentifier)
+        this[Tables.Actions.oldObjectId] = getOrCreateRegistryKeyId(action.oldObjectIdentifier)
+        this[Tables.Actions.world] = getOrCreateWorldId(
+            action.world ?: Ledger.server.overworld().dimension().identifier(),
+        )
+        this[Tables.Actions.blockState] = action.objectState
+        this[Tables.Actions.oldBlockState] = action.oldObjectState
+        this[Tables.Actions.sourceName] = getOrCreateSourceId(action.sourceName)
+        this[Tables.Actions.sourcePlayer] = action.sourceProfile?.let { getOrCreatePlayerId(it.id) }
+        this[Tables.Actions.extraData] = action.extraData
+    }
+
     private fun Transaction.insertActions(actions: List<ActionType>) {
         val (safe, oversized) = actions.partition {
-            it.extraData == null || it.extraData!!.length <= MAX_EXTRA_DATA_BYTES
+            it.extraData == null || it.extraData!!.length <= MAX_EXTRA_DATA_CHARS
         }
         oversized.forEach { action ->
             logWarn(
@@ -475,24 +598,7 @@ object DatabaseManager {
                     "by ${action.sourceProfile?.name ?: action.sourceName}",
             )
         }
-        Tables.Actions.batchInsert(safe, shouldReturnGeneratedValues = false) { action ->
-            this[Tables.Actions.actionIdentifier] = getOrCreateActionId(action.identifier)
-            this[Tables.Actions.timestamp] = action.timestamp
-            this[Tables.Actions.x] = action.pos.x
-            this[Tables.Actions.y] = action.pos.y
-            this[Tables.Actions.z] = action.pos.z
-            this[Tables.Actions.objectId] = getOrCreateRegistryKeyId(action.objectIdentifier)
-            this[Tables.Actions.oldObjectId] = getOrCreateRegistryKeyId(action.oldObjectIdentifier)
-            this[Tables.Actions.world] = getOrCreateWorldId(
-                action.world ?: Ledger.server.overworld().dimension()
-                    .identifier(),
-            )
-            this[Tables.Actions.blockState] = action.objectState
-            this[Tables.Actions.oldBlockState] = action.oldObjectState
-            this[Tables.Actions.sourceName] = getOrCreateSourceId(action.sourceName)
-            this[Tables.Actions.sourcePlayer] = action.sourceProfile?.let { getOrCreatePlayerId(it.id) }
-            this[Tables.Actions.extraData] = action.extraData
-        }
+        Tables.Actions.batchInsert(safe, shouldReturnGeneratedValues = false) { action -> bindAction(action) }
     }
 
     private fun Transaction.insertOrUpdatePlayer(uuid: UUID, name: String) {
