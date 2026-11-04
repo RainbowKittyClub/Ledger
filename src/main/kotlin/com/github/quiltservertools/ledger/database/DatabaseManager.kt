@@ -9,6 +9,7 @@ import com.github.quiltservertools.ledger.api.BatchAck
 import com.github.quiltservertools.ledger.api.ProducerBatch
 import com.github.quiltservertools.ledger.api.ProducerBatchException
 import com.github.quiltservertools.ledger.api.ProducerReceipt
+import com.github.quiltservertools.ledger.api.ReplayMode
 import com.github.quiltservertools.ledger.config.DatabaseSpec
 import com.github.quiltservertools.ledger.config.SearchSpec
 import com.github.quiltservertools.ledger.config.config
@@ -80,9 +81,12 @@ const val MAX_QUERY_RETRIES = 10
 const val MIN_RETRY_DELAY = 1000L
 const val MAX_RETRY_DELAY = 300_000L
 internal const val MAX_EXTRA_DATA_CHARS = 65_535
+private const val REPLAY_FLAG_CHUNK = 500
 private const val PRODUCER_SCHEMA_COMPONENT = "producer_batches"
 private const val PRODUCER_SCHEMA_VERSION = 1
 
+// Upstream's class was at the limit; the fork's producer and replay transactions need its private helpers.
+@Suppress("LargeClass")
 object DatabaseManager {
 
     // These values are initialised late to allow the database to be created at server start,
@@ -205,6 +209,14 @@ object DatabaseManager {
 
     suspend fun restoreActions(actionIds: Set<Int>) = execute {
         return@execute restoreActions(actionIds)
+    }
+
+    // Applied flags and the replay's audit row commit together; IN lists stay under SQLite's bound-parameter cap.
+    suspend fun recordReplay(mode: ReplayMode, applied: Set<Int>, audit: ActionType) = execute {
+        applied.chunked(REPLAY_FLAG_CHUNK).forEach {
+            if (mode == ReplayMode.ROLLBACK) rollbackActions(it.toSet()) else restoreActions(it.toSet())
+        }
+        insertActions(listOf(audit))
     }
 
     suspend fun selectRollback(params: ActionSearchParams): List<ActionType> = execute {

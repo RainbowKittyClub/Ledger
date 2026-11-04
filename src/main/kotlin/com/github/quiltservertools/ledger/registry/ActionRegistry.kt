@@ -37,6 +37,7 @@ object ActionRegistry {
         registerActionType { EntityChangeActionType() }
         registerActionType { EntityMountActionType() }
         registerActionType { EntityDismountActionType() }
+        registerActionType { ReplayActionType() }
     }
 
     fun getType(id: String) = actionTypes[id]

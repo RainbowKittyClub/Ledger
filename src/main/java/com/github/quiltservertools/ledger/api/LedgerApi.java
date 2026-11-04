@@ -7,6 +7,7 @@ import com.github.quiltservertools.ledger.actionutils.SearchResults;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import net.minecraft.commands.CommandSourceStack;
 import org.jetbrains.annotations.Nullable;
 
 public interface LedgerApi {
@@ -81,6 +82,34 @@ public interface LedgerApi {
      * @return The batch size limit
      */
     int producerBatchLimit();
+
+    /** Version of the replay contract below; absent on Ledger builds without it. */
+    int REPLAY_API_VERSION = 1;
+
+    /**
+     * Rolls back or restores the matching actions as {@code source}, the command and API path alike.
+     * The world changes through the registered {@link ReplayGuard} when there is one, otherwise
+     * through each action's own rollback or restore. Only applied actions change their flag, and
+     * that change commits together with one audit row for the replay itself.
+     * @param source the operator, checked again before every write
+     * @param params which actions
+     * @param mode rollback or restore
+     * @return Completes after the flags and the audit row are committed
+     */
+    CompletableFuture<ReplayResult> replay(CommandSourceStack source, ActionSearchParams params, ReplayMode mode);
+
+    /**
+     * Routes every replay's world changes through {@code guard} until it is unregistered.
+     * @param guard the guard
+     * @throws IllegalStateException if another guard is registered
+     */
+    void registerReplayGuard(ReplayGuard guard);
+
+    /**
+     * Removes {@code guard} if it is the registered one.
+     * @param guard the guard
+     */
+    void unregisterReplayGuard(ReplayGuard guard);
 
     /**
      * Reads stored producer keys for one operation, for restart and retry decisions.

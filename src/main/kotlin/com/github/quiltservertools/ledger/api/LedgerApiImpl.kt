@@ -7,7 +7,9 @@ import com.github.quiltservertools.ledger.actionutils.SearchResults
 import com.github.quiltservertools.ledger.database.ActionQueueService
 import com.github.quiltservertools.ledger.database.DatabaseManager
 import com.github.quiltservertools.ledger.database.ProducerBatchService
+import com.github.quiltservertools.ledger.database.ReplayService
 import kotlinx.coroutines.future.future
+import net.minecraft.commands.CommandSourceStack
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 
@@ -36,4 +38,14 @@ internal object LedgerApiImpl : LedgerApi {
 
     override fun producerReceipts(producer: String, operationId: UUID): CompletableFuture<List<ProducerReceipt>> =
         Ledger.future { DatabaseManager.producerReceipts(producer, operationId) }
+
+    override fun replay(
+        source: CommandSourceStack,
+        params: ActionSearchParams,
+        mode: ReplayMode,
+    ): CompletableFuture<ReplayResult> = ReplayService.replay(source, params, mode)
+
+    override fun registerReplayGuard(guard: ReplayGuard) = ReplayService.register(guard)
+
+    override fun unregisterReplayGuard(guard: ReplayGuard) = ReplayService.unregister(guard)
 }

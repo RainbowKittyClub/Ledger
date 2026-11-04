@@ -34,6 +34,10 @@
     "text.ledger.restore.finish": "Restore complete",
     "text.ledger.restore.fail": "Failed to restore %s x%s",
 
+    "text.ledger.replay.outcome": "%s applied, %s conflicting, %s denied, %s unsupported, %s failed; only applied actions were marked",
+    "text.ledger.replay.failed": "Replay failed: %s; no actions were marked",
+    "text.ledger.action.ledger-replay": "replayed",
+
     "text.ledger.inspect.toggle": "Inspect mode: %s",
     "text.ledger.inspect.on": "Enabled",
     "text.ledger.inspect.off": "Disabled",
