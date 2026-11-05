@@ -329,15 +329,18 @@ object DatabaseManager {
         orColumn: Column<C>? = null,
     ): Op<Boolean> {
         val idParamSet = mutableSetOf<Negatable<E>>()
+        var unknownAllowed = false
         paramSet?.forEach {
             val paramId = objectToId.apply(it.property)
             if (paramId != null) {
                 idParamSet.add(Negatable(paramId, it.allowed))
-            } else {
-                // Unknown source name
-                return Op.FALSE
+            } else if (it.allowed) {
+                unknownAllowed = true
             }
         }
+        // A name never recorded matches no row: it adds nothing to the allowed names and removes
+        // nothing when denied. Only allowed names that are all unrecorded match nothing.
+        if (unknownAllowed && idParamSet.none { it.allowed }) return Op.FALSE
         return addParameters(op, idParamSet, column, orColumn)
     }
 
