@@ -49,10 +49,12 @@ import org.jetbrains.exposed.v1.core.or
 import org.jetbrains.exposed.v1.core.statements.BatchInsertStatement
 import org.jetbrains.exposed.v1.core.statements.StatementContext
 import org.jetbrains.exposed.v1.core.statements.expandArgs
+import org.jetbrains.exposed.v1.core.vendors.PostgreSQLDialect
 import org.jetbrains.exposed.v1.dao.Entity
 import org.jetbrains.exposed.v1.dao.EntityClass
 import org.jetbrains.exposed.v1.dao.IntEntityClass
 import org.jetbrains.exposed.v1.jdbc.Database
+import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.Query
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import org.jetbrains.exposed.v1.jdbc.andWhere
@@ -565,9 +567,7 @@ object DatabaseManager {
             it[Tables.ProducerBatches.producer] = batch.producer()
             it[Tables.ProducerBatches.operationId] = batch.operationId()
         }
-        val actionIds = Tables.Actions.batchInsert(fresh.map { it.action() }, shouldReturnGeneratedValues = true) {
-            bindAction(it)
-        }.map { it[Tables.Actions.id] }
+        val actionIds = insertProducerActions(fresh.map { it.action() })
         check(actionIds.size == fresh.size) { "Inserted ${actionIds.size} action rows for ${fresh.size} entries" }
         Tables.ProducerReceipts.batchInsert(
             fresh.zip(actionIds),
@@ -581,6 +581,33 @@ object DatabaseManager {
             this[Tables.ProducerReceipts.action] = actionId
         }
         return BatchAck(batch.producer(), batch.operationId(), batchId.value, fresh.map { it.sequence() }, duplicates)
+    }
+
+    // PostgreSQL cannot rewrite generated-key batches. Allocate from the real sequence, not MAX(id),
+    // so ordinary inserts and other writers remain safe; rollback may leave normal sequence gaps.
+    // Receipt links use these exact ids and commit in the same transaction as their actions.
+    private fun Transaction.insertProducerActions(actions: List<ActionType>): List<EntityID<Int>> {
+        if (db.dialect !is PostgreSQLDialect) {
+            return Tables.Actions.batchInsert(actions, shouldReturnGeneratedValues = true) {
+                bindAction(it)
+            }.map { it[Tables.Actions.id] }
+        }
+        // execute() exposes the common Transaction type, but always opens a JDBC transaction.
+        val ids: List<EntityID<Int>> = (this as JdbcTransaction).exec(
+            "SELECT nextval(pg_get_serial_sequence('actions', 'id')) FROM generate_series(1, ${actions.size})",
+        ) { result ->
+            buildList<EntityID<Int>> {
+                while (result.next()) {
+                    add(EntityID(Math.toIntExact(result.getLong(1)), Tables.Actions))
+                }
+            }
+        } ?: error("PostgreSQL returned no reserved action ids")
+        check(ids.size == actions.size && ids.toSet().size == ids.size) { "Invalid reserved action ids" }
+        Tables.Actions.batchInsert(actions.zip(ids), shouldReturnGeneratedValues = false) { (action, id) ->
+            this[Tables.Actions.id] = id
+            bindAction(action)
+        }
+        return ids
     }
 
     private fun BatchInsertStatement.bindAction(action: ActionType) {
